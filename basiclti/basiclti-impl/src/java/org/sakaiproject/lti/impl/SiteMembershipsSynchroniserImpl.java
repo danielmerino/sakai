@@ -1,5 +1,6 @@
 package org.sakaiproject.lti.impl;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
@@ -18,7 +19,6 @@ import org.sakaiproject.basiclti.util.LegacyShaUtil;
 import org.sakaiproject.authz.api.SecurityAdvisor;
 import org.sakaiproject.authz.cover.SecurityService;
 import org.sakaiproject.exception.IdUnusedException;
-import org.sakaiproject.lti.api.LTIException;
 import org.sakaiproject.lti.api.SiteMembershipUpdater;
 import org.sakaiproject.lti.api.UserFinderOrCreator;
 import org.sakaiproject.lti.api.SiteMembershipsSynchroniser;
@@ -80,14 +80,15 @@ public class SiteMembershipsSynchroniserImpl implements SiteMembershipsSynchroni
 		SecurityService.popAdvisor();
 	}
 
-    public void synchroniseSiteMemberships(final String siteId, final String membershipsId, final String membershipsUrl, final String oauth_consumer_key, final String callbackType) throws LTIException {
+    public void synchroniseSiteMemberships(final String siteId, final String membershipsId, final String membershipsUrl, final String oauth_consumer_key, final String callbackType) {
 
         Site site = null;
 
         try {
             site = siteService.getSite(siteId);
         } catch (IdUnusedException iue) {
-            throw new LTIException("site.notfound", siteId, null);
+            M_log.error("site.notfound id: " + siteId + ". This site's memberships will NOT be synchronised.", iue);
+            return;
         }
 
         if (BasicLTIConstants.LTI_VERSION_1.equals(callbackType)) {
@@ -101,13 +102,14 @@ public class SiteMembershipsSynchroniserImpl implements SiteMembershipsSynchroni
         }
     }
 
-    private final void synchronizeLTI1SiteMemberships(final Site site, final String membershipsId, final String membershipsUrl, final String oauth_consumer_key) throws LTIException {
+    private final void synchronizeLTI1SiteMemberships(final Site site, final String membershipsId, final String membershipsUrl, final String oauth_consumer_key) {
 
         // Lookup the secret
         final String configPrefix = "basiclti.provider." + oauth_consumer_key + ".";
         final String oauth_secret = serverConfigurationService.getString(configPrefix+ "secret", null);
         if (oauth_secret == null) {
-            throw new LTIException( "launch.key.notfound", oauth_consumer_key, null);
+            M_log.error("launch.key.notfound " + oauth_consumer_key + ". This site's memberships will NOT be synchronised.");
+            return;
         }
 
         OAuthMessage om = new OAuthMessage("POST", membershipsUrl, null);
@@ -144,13 +146,14 @@ public class SiteMembershipsSynchroniserImpl implements SiteMembershipsSynchroni
         }
     }
 
-    private final void synchronizeMoodleExtSiteMemberships(final Site site, final String membershipsId, final String membershipsUrl, final String oauth_consumer_key) throws LTIException {
+    private final void synchronizeMoodleExtSiteMemberships(final Site site, final String membershipsId, final String membershipsUrl, final String oauth_consumer_key) {
 
         // Lookup the secret
         final String configPrefix = "basiclti.provider." + oauth_consumer_key + ".";
         final String oauth_secret = serverConfigurationService.getString(configPrefix+ "secret", null);
         if (oauth_secret == null) {
-            throw new LTIException( "launch.key.notfound", oauth_consumer_key, null);
+            M_log.error("launch.key.notfound " + oauth_consumer_key + ". This site's memberships will NOT be synchronised.");
+            return;
         }
 
         String type = "readMembershipsWithGroups";
@@ -266,46 +269,42 @@ public class SiteMembershipsSynchroniserImpl implements SiteMembershipsSynchroni
             siteMembershipUpdater.addOrUpdateSiteMembership(map, false, user, site);
         }
 
-        Collection sakaiGroups = site.getGroups();
+        // Do this so we don't get a concurrent mod exception
+        List groups = new ArrayList(site.getGroups());
+
+        // Remove the existing groups
+        for (Iterator i = groups.iterator(); i.hasNext(); ) {
+            site.removeGroup((Group) i.next());
+        }
 
         for (String consumerGroupTitle : consumerGroups.keySet()) {
-            M_log.debug("Processing consumer group '" + consumerGroupTitle + "' ...");
-            Group sakaiGroup = null;
-            // See if the group exists already
-            for (Iterator i = sakaiGroups.iterator();i.hasNext();) {
-                Group currentSakaiGroup = (Group) i.next();
-                if (consumerGroupTitle.equals(currentSakaiGroup.getTitle())) {
-                    sakaiGroup = currentSakaiGroup;
-                    break;
-                }
+            if (M_log.isDebugEnabled()) {
+                M_log.debug("Creating group with title '" + consumerGroupTitle + "' ...");
             }
 
-            if (sakaiGroup == null) {
-                // New group. Create it.
-                if (M_log.isDebugEnabled()) M_log.debug("Creating group with title '" + consumerGroupTitle + "' ...");
-                sakaiGroup = site.addGroup();
-                sakaiGroup.getProperties().addProperty(sakaiGroup.GROUP_PROP_WSETUP_CREATED, Boolean.TRUE.toString());
-                sakaiGroup.setTitle(consumerGroupTitle);
-
-            } else {
-                M_log.debug("Existing group. Removing current membership ...");
-                sakaiGroup.removeMembers();
-            }
+            Group sakaiGroup = site.addGroup();
+            sakaiGroup.getProperties().addProperty(sakaiGroup.GROUP_PROP_WSETUP_CREATED, Boolean.TRUE.toString());
+            sakaiGroup.setTitle(consumerGroupTitle);
 
             for (POXMembershipsResponse.Member consumerGroupMember : consumerGroups.get(consumerGroupTitle)) {
-                if (M_log.isDebugEnabled()) M_log.debug("Adding '" + consumerGroupMember.firstName + " " + consumerGroupMember.lastName + "' to '" + consumerGroupTitle + "' ...");
-                sakaiGroup.addMember(consumerGroupMember.userId,consumerGroupMember.role,true,false);
-            }
+                if (M_log.isDebugEnabled()) {
+                    M_log.debug("Adding '" + consumerGroupMember.firstName + " " + consumerGroupMember.lastName + "' to '" + consumerGroupTitle + "' ...");
+                }
 
-            pushAdvisor();
-            try {
-                siteService.save(site);
-                M_log.info("Updated  site=" + site.getId() + " group=" + consumerGroupTitle);
-            } catch (Exception e) {
-                M_log.error("Failed to add group '" + consumerGroupTitle + "' to site", e);
-            } finally {
-                popAdvisor();
+                sakaiGroup.addMember(consumerGroupMember.userId, consumerGroupMember.role, true, false);
             }
+        }
+
+        pushAdvisor();
+        try {
+            siteService.save(site);
+            //M_log.info("Updated  site=" + site.getId() + " group=" + consumerGroupTitle);
+            M_log.info("Updated  site=" + site.getId());
+        } catch (Exception e) {
+            //M_log.error("Failed to add group '" + consumerGroupTitle + "' to site", e);
+            M_log.info("Failed to update site=" + site.getId());
+        } finally {
+            popAdvisor();
         }
     }
 }
